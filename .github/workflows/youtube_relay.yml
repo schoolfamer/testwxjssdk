@@ -1,0 +1,124 @@
+name: YouTube Audio Relay Worker
+
+on:
+  repository_dispatch:
+    types: [youtube_extract]
+  workflow_dispatch:
+    inputs:
+      task_id:
+        description: 'Task ID from TranscripApi'
+        required: true
+        default: 'test-manual-task'
+      video_url:
+        description: 'YouTube Video URL to extract'
+        required: true
+        default: 'https://youtu.be/9Jg5b9Fgt6M'
+      callback_url:
+        description: 'Callback endpoint URL'
+        required: false
+        default: 'https://transcript.unithought.com/api/internal/youtube_callback'
+
+jobs:
+  extract_and_callback:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install System Dependencies (ffmpeg, curl, jq)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg curl jq
+
+      - name: Install yt-dlp
+        run: |
+          python -m pip install --upgrade pip yt-dlp
+
+      - name: Extract YouTube Audio and Relay
+        run: |
+          set -e
+
+          # Parse inputs from repository_dispatch or workflow_dispatch
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            TASK_ID="${{ github.event.client_payload.task_id }}"
+            VIDEO_URL="${{ github.event.client_payload.video_url }}"
+            CALLBACK_URL="${{ github.event.client_payload.callback_url }}"
+          else
+            TASK_ID="${{ github.event.inputs.task_id }}"
+            VIDEO_URL="${{ github.event.inputs.video_url }}"
+            CALLBACK_URL="${{ github.event.inputs.callback_url }}"
+          fi
+
+          if [ -z "$CALLBACK_URL" ]; then
+            CALLBACK_URL="https://transcript.unithought.com/api/internal/youtube_callback"
+          fi
+
+          AUTH_TOKEN="${{ secrets.CALLBACK_TOKEN || secrets.MASTER_SECRET || 'Unithought2425' }}"
+
+          echo "================================================"
+          echo "Starting Overseas YouTube Extraction"
+          echo "Task ID: $TASK_ID"
+          echo "Video URL: $VIDEO_URL"
+          echo "Callback URL: $CALLBACK_URL"
+          echo "================================================"
+
+          # Extract metadata first
+          echo "Fetching video metadata..."
+          METADATA_JSON=$(yt-dlp --dump-json --no-warnings "$VIDEO_URL" 2>/dev/null || true)
+
+          if [ -n "$METADATA_JSON" ]; then
+            TITLE=$(echo "$METADATA_JSON" | jq -r '.title // "YouTube Video"')
+            AUTHOR=$(echo "$METADATA_JSON" | jq -r '.uploader // .channel // "未知UP主"')
+            DURATION=$(echo "$METADATA_JSON" | jq -r '.duration // 0')
+          else
+            TITLE="YouTube Video"
+            AUTHOR="YouTube"
+            DURATION="0"
+          fi
+
+          echo "Title: $TITLE"
+          echo "Author: $AUTHOR"
+          echo "Duration: ${DURATION}s"
+
+          # Extract audio stream as lightweight MP3
+          echo "Downloading and extracting audio stream via yt-dlp..."
+          yt-dlp -x --audio-format mp3 --audio-quality 128K \
+            --extractor-args "youtube:player_client=mweb,android" \
+            -o "extracted_audio.mp3" \
+            "$VIDEO_URL" || true
+
+          if [ ! -f "extracted_audio.mp3" ]; then
+            echo "Error: Audio extraction failed!"
+            curl -s -X POST "$CALLBACK_URL/fail" \
+              -H "Authorization: Bearer $AUTH_TOKEN" \
+              -F "task_id=$TASK_ID" \
+              -F "error=GitHub Actions overseas runner failed to download audio stream" || true
+            exit 1
+          fi
+
+          FILE_SIZE=$(stat -c%s "extracted_audio.mp3" 2>/dev/null || stat -f%z "extracted_audio.mp3")
+          echo "Extracted MP3 File Size: $FILE_SIZE bytes"
+
+          echo "Relaying audio back to TranscripApi..."
+          HTTP_STATUS=$(curl -s -o /tmp/resp.txt -w "%{http_code}" -X POST "$CALLBACK_URL" \
+            -H "Authorization: Bearer $AUTH_TOKEN" \
+            -F "task_id=$TASK_ID" \
+            -F "file=@extracted_audio.mp3;type=audio/mpeg" \
+            -F "title=$TITLE" \
+            -F "author=$AUTHOR" \
+            -F "duration=$DURATION")
+
+          echo "Server Response Code: $HTTP_STATUS"
+          cat /tmp/resp.txt
+          echo ""
+
+          if [ "$HTTP_STATUS" != "200" ] && [ "$HTTP_STATUS" != "201" ]; then
+            echo "Failed to callback server with HTTP $HTTP_STATUS"
+            exit 1
+          fi
+
+          echo "Relay completed successfully!"
