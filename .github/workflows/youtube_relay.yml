@@ -42,7 +42,6 @@ jobs:
         run: |
           set -e
 
-          # Parse inputs from repository_dispatch or workflow_dispatch
           if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
             TASK_ID="${{ github.event.client_payload.task_id }}"
             VIDEO_URL="${{ github.event.client_payload.video_url }}"
@@ -66,9 +65,8 @@ jobs:
           echo "Callback URL: $CALLBACK_URL"
           echo "================================================"
 
-          # Extract metadata first
           echo "Fetching video metadata..."
-          METADATA_JSON=$(yt-dlp --dump-json --no-warnings "$VIDEO_URL" 2>/dev/null || true)
+          METADATA_JSON=$(yt-dlp --no-playlist --dump-json --no-warnings "$VIDEO_URL" 2>/dev/null || true)
 
           if [ -n "$METADATA_JSON" ]; then
             TITLE=$(echo "$METADATA_JSON" | jq -r '.title // "YouTube Video"')
@@ -84,11 +82,10 @@ jobs:
           echo "Author: $AUTHOR"
           echo "Duration: ${DURATION}s"
 
-          # Extract audio stream as lightweight MP3
           echo "Downloading and extracting audio stream via yt-dlp..."
-          yt-dlp -x --audio-format mp3 --audio-quality 128K \
-            --extractor-args "youtube:player_client=mweb,android" \
-            -o "extracted_audio.mp3" \
+          yt-dlp --no-playlist -x --audio-format mp3 --audio-quality 128K \
+            --force-overwrites \
+            -o "extracted_audio.%(ext)s" \
             "$VIDEO_URL" || true
 
           if [ ! -f "extracted_audio.mp3" ]; then
