@@ -39,21 +39,23 @@ jobs:
           python -m pip install --upgrade pip yt-dlp
 
       - name: Prepare YouTube Cookies (if configured)
+        env:
+          YT_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
         run: |
-          if [ -n "${{ secrets.YOUTUBE_COOKIES }}" ]; then
-            echo "${{ secrets.YOUTUBE_COOKIES }}" > /tmp/yt_cookies.txt
+          if [ -n "$YT_COOKIES" ]; then
+            printf "%s" "$YT_COOKIES" > /tmp/yt_cookies.txt
             echo "YouTube Cookies loaded for bot-check bypass."
           fi
 
       - name: Poll YouTube Channel / Playlist Feed
         if: github.event.action == 'youtube_feed_poll'
+        env:
+          FEED_ID: ${{ github.event.client_payload.feed_id }}
+          TARGET_URL: ${{ github.event.client_payload.target_url }}
+          CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+          AUTH_TOKEN: ${{ secrets.CALLBACK_TOKEN || secrets.MASTER_SECRET || 'Unithought2425' }}
         run: |
           set -e
-          FEED_ID="${{ github.event.client_payload.feed_id }}"
-          TARGET_URL="${{ github.event.client_payload.target_url }}"
-          CALLBACK_URL="${{ github.event.client_payload.callback_url }}"
-          AUTH_TOKEN="${{ secrets.CALLBACK_TOKEN || secrets.MASTER_SECRET || 'Unithought2425' }}"
-
           COOKIE_ARG=""
           if [ -f /tmp/yt_cookies.txt ]; then
             COOKIE_ARG="--cookies /tmp/yt_cookies.txt"
@@ -63,8 +65,8 @@ jobs:
           yt-dlp $COOKIE_ARG --flat-playlist --playlist-end 15 --dump-single-json --no-warnings "$TARGET_URL" > /tmp/feed.json || true
 
           python3 - << 'EOF' > /tmp/payload.json
-          import json, os, sys
-          feed_id = os.environ.get("FEED_ID", "${{ github.event.client_payload.feed_id }}")
+          import json, os
+          feed_id = os.environ.get("FEED_ID", "")
           try:
               with open("/tmp/feed.json") as f:
                   data = json.load(f)
@@ -88,6 +90,8 @@ jobs:
 
       - name: Extract YouTube Audio and Relay
         if: github.event.action != 'youtube_feed_poll'
+        env:
+          AUTH_TOKEN: ${{ secrets.CALLBACK_TOKEN || secrets.MASTER_SECRET || 'Unithought2425' }}
         run: |
           set -e
           if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
@@ -103,7 +107,6 @@ jobs:
           if [ -z "$CALLBACK_URL" ]; then
             CALLBACK_URL="https://transcript.unithought.com/api/internal/youtube_callback"
           fi
-          AUTH_TOKEN="${{ secrets.CALLBACK_TOKEN || secrets.MASTER_SECRET || 'Unithought2425' }}"
 
           COOKIE_ARG=""
           if [ -f /tmp/yt_cookies.txt ]; then
