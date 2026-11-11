@@ -2,24 +2,24 @@ name: YouTube Audio Relay Worker
 
 on:
   repository_dispatch:
-    types: [youtube_extract]
+    types: [youtube_extract, youtube_feed_poll]
   workflow_dispatch:
     inputs:
       task_id:
-        description: 'Task ID from TranscripApi'
+        description: "Task ID from TranscripApi"
         required: true
-        default: 'test-manual-task'
+        default: "test-manual-task"
       video_url:
-        description: 'YouTube Video URL to extract'
+        description: "YouTube Video URL to extract"
         required: true
-        default: 'https://youtu.be/9Jg5b9Fgt6M'
+        default: "https://youtu.be/9Jg5b9Fgt6M"
       callback_url:
-        description: 'Callback endpoint URL'
+        description: "Callback endpoint URL"
         required: false
-        default: 'https://transcript.unithought.com/api/internal/youtube_callback'
+        default: "https://transcript.unithought.com/api/internal/youtube_callback"
 
 jobs:
-  extract_and_callback:
+  relay_worker:
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -27,7 +27,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install System Dependencies (ffmpeg, curl, jq)
         run: |
@@ -38,10 +38,58 @@ jobs:
         run: |
           python -m pip install --upgrade pip yt-dlp
 
-      - name: Extract YouTube Audio and Relay
+      - name: Prepare YouTube Cookies (if configured)
+        run: |
+          if [ -n "${{ secrets.YOUTUBE_COOKIES }}" ]; then
+            echo "${{ secrets.YOUTUBE_COOKIES }}" > /tmp/yt_cookies.txt
+            echo "YouTube Cookies loaded for bot-check bypass."
+          fi
+
+      - name: Poll YouTube Channel / Playlist Feed
+        if: github.event.action == 'youtube_feed_poll'
         run: |
           set -e
+          FEED_ID="${{ github.event.client_payload.feed_id }}"
+          TARGET_URL="${{ github.event.client_payload.target_url }}"
+          CALLBACK_URL="${{ github.event.client_payload.callback_url }}"
+          AUTH_TOKEN="${{ secrets.CALLBACK_TOKEN || secrets.MASTER_SECRET || 'Unithought2425' }}"
 
+          COOKIE_ARG=""
+          if [ -f /tmp/yt_cookies.txt ]; then
+            COOKIE_ARG="--cookies /tmp/yt_cookies.txt"
+          fi
+
+          echo "Polling YouTube Feed: $FEED_ID ($TARGET_URL)"
+          yt-dlp $COOKIE_ARG --flat-playlist --playlist-end 15 --dump-single-json --no-warnings "$TARGET_URL" > /tmp/feed.json || true
+
+          python3 - << 'EOF' > /tmp/payload.json
+          import json, os, sys
+          feed_id = os.environ.get("FEED_ID", "${{ github.event.client_payload.feed_id }}")
+          try:
+              with open("/tmp/feed.json") as f:
+                  data = json.load(f)
+              entries = data.get("entries", [])
+              items = []
+              for e in entries[:15]:
+                  vid = e.get("id")
+                  if not vid: continue
+                  items.append({
+                      "id": vid,
+                      "title": e.get("title") or "YouTube Video",
+                      "url": e.get("url") or f"https://www.youtube.com/watch?v={vid}",
+                      "duration": e.get("duration") or 0
+                  })
+              print(json.dumps({"feed_id": feed_id, "items": items}, ensure_ascii=False))
+          except Exception as ex:
+              print(json.dumps({"feed_id": feed_id, "items": [], "error": str(ex)}))
+          EOF
+
+          curl -s -X POST "$CALLBACK_URL"             -H "Authorization: Bearer $AUTH_TOKEN"             -H "Content-Type: application/json"             -d @/tmp/payload.json
+
+      - name: Extract YouTube Audio and Relay
+        if: github.event.action != 'youtube_feed_poll'
+        run: |
+          set -e
           if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
             TASK_ID="${{ github.event.client_payload.task_id }}"
             VIDEO_URL="${{ github.event.client_payload.video_url }}"
@@ -55,18 +103,14 @@ jobs:
           if [ -z "$CALLBACK_URL" ]; then
             CALLBACK_URL="https://transcript.unithought.com/api/internal/youtube_callback"
           fi
-
           AUTH_TOKEN="${{ secrets.CALLBACK_TOKEN || secrets.MASTER_SECRET || 'Unithought2425' }}"
 
-          echo "================================================"
-          echo "Starting Overseas YouTube Extraction"
-          echo "Task ID: $TASK_ID"
-          echo "Video URL: $VIDEO_URL"
-          echo "Callback URL: $CALLBACK_URL"
-          echo "================================================"
+          COOKIE_ARG=""
+          if [ -f /tmp/yt_cookies.txt ]; then
+            COOKIE_ARG="--cookies /tmp/yt_cookies.txt"
+          fi
 
-          echo "Fetching video metadata..."
-          METADATA_JSON=$(yt-dlp --no-playlist --dump-json --no-warnings "$VIDEO_URL" 2>/dev/null || true)
+          METADATA_JSON=$(yt-dlp $COOKIE_ARG --js-runtimes node --extractor-args "youtube:player-client=web,ios" --no-playlist --dump-json --no-warnings "$VIDEO_URL" 2>/dev/null || true)
 
           if [ -n "$METADATA_JSON" ]; then
             TITLE=$(echo "$METADATA_JSON" | jq -r '.title // "YouTube Video"')
@@ -78,44 +122,15 @@ jobs:
             DURATION="0"
           fi
 
-          echo "Title: $TITLE"
-          echo "Author: $AUTHOR"
-          echo "Duration: ${DURATION}s"
-
-          echo "Downloading and extracting audio stream via yt-dlp..."
-          yt-dlp --no-playlist -x --audio-format mp3 --audio-quality 128K \
-            --force-overwrites \
-            -o "extracted_audio.%(ext)s" \
-            "$VIDEO_URL" || true
+          yt-dlp $COOKIE_ARG --js-runtimes node --extractor-args "youtube:player-client=web,ios" --no-playlist -x --audio-format mp3 --audio-quality 128K --force-overwrites -o "extracted_audio.%(ext)s" "$VIDEO_URL" || true
 
           if [ ! -f "extracted_audio.mp3" ]; then
-            echo "Error: Audio extraction failed!"
-            curl -s -X POST "$CALLBACK_URL/fail" \
-              -H "Authorization: Bearer $AUTH_TOKEN" \
-              -F "task_id=$TASK_ID" \
-              -F "error=GitHub Actions overseas runner failed to download audio stream" || true
+            curl -s -X POST "$CALLBACK_URL/fail"               -H "Authorization: Bearer $AUTH_TOKEN"               -F "task_id=$TASK_ID"               -F "error=GitHub Actions overseas runner failed to download audio stream (bot check or unavailable)" || true
             exit 1
           fi
 
-          FILE_SIZE=$(stat -c%s "extracted_audio.mp3" 2>/dev/null || stat -f%z "extracted_audio.mp3")
-          echo "Extracted MP3 File Size: $FILE_SIZE bytes"
-
-          echo "Relaying audio back to TranscripApi..."
-          HTTP_STATUS=$(curl -s -o /tmp/resp.txt -w "%{http_code}" -X POST "$CALLBACK_URL" \
-            -H "Authorization: Bearer $AUTH_TOKEN" \
-            -F "task_id=$TASK_ID" \
-            -F "file=@extracted_audio.mp3;type=audio/mpeg" \
-            -F "title=$TITLE" \
-            -F "author=$AUTHOR" \
-            -F "duration=$DURATION")
-
-          echo "Server Response Code: $HTTP_STATUS"
-          cat /tmp/resp.txt
-          echo ""
+          HTTP_STATUS=$(curl -s -o /tmp/resp.txt -w "%{http_code}" -X POST "$CALLBACK_URL"             -H "Authorization: Bearer $AUTH_TOKEN"             -F "task_id=$TASK_ID"             -F "file=@extracted_audio.mp3;type=audio/mpeg"             -F "title=$TITLE"             -F "author=$AUTHOR"             -F "duration=$DURATION")
 
           if [ "$HTTP_STATUS" != "200" ] && [ "$HTTP_STATUS" != "201" ]; then
-            echo "Failed to callback server with HTTP $HTTP_STATUS"
             exit 1
           fi
-
-          echo "Relay completed successfully!"
