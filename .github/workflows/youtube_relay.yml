@@ -43,8 +43,27 @@ jobs:
           YT_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
         run: |
           if [ -n "$YT_COOKIES" ]; then
-            printf "%s" "$YT_COOKIES" > /tmp/yt_cookies.txt
-            echo "YouTube Cookies loaded for bot-check bypass."
+            python3 - << 'EOF'
+          import os, time
+          raw = os.environ.get("YT_COOKIES", "").strip()
+          if raw.lstrip().startswith("#") or "\t" in raw:
+              out = raw + "\n"
+          else:
+              lines = ["# Netscape HTTP Cookie File", "# Auto-converted from Cookie header"]
+              exp = str(int(time.time()) + 180 * 86400)
+              for part in raw.split(";"):
+                  part = part.strip()
+                  if "=" in part:
+                      k, v = part.split("=", 1)
+                      k, v = k.strip(), v.strip()
+                      if k:
+                          sec = "TRUE" if k.startswith("__Secure-") else "FALSE"
+                          lines.append(f".youtube.com\tTRUE\t/\t{sec}\t{exp}\t{k}\t{v}")
+              out = "\n".join(lines) + "\n"
+          with open("/tmp/yt_cookies.txt", "w", encoding="utf-8") as f:
+              f.write(out)
+          print("YouTube Cookies prepared in Netscape format.")
+          EOF
           fi
 
       - name: Poll YouTube Channel / Playlist Feed
