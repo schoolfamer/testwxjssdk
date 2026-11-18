@@ -24,6 +24,14 @@ jobs:
     timeout-minutes: 20
 
     steps:
+      - name: Set up Cloudflare WARP (Bypass Datacenter IP Block)
+        uses: fscarmen/warp-on-actions@v1.4
+
+      - name: Verify Network Egress
+        run: |
+          echo "=== Public IP & Cloudflare Network Status ==="
+          curl -s https://cloudflare.com/cdn-cgi/trace | head -n 6 || true
+
       - name: Set up Deno (Recommended JS Engine for YouTube challenges)
         uses: denoland/setup-deno@v2
         with:
@@ -43,7 +51,7 @@ jobs:
         run: |
           docker run --name bgutil-provider -d --init -p 127.0.0.1:4416:4416 brainicism/bgutil-ytdlp-pot-provider
           sleep 3
-          curl -s http://127.0.0.1:4416/ping || curl -s http://127.0.0.1:4416/ || echo "bgutil provider started"
+          curl -s http://127.0.0.1:4416/ping || curl -s http://127.0.0.1:4416/ || echo "bgutil provider active"
 
       - name: Install System Dependencies (ffmpeg, curl, jq)
         run: |
@@ -104,7 +112,7 @@ jobs:
           '
           fi
 
-      - name: Debug Environment and Cookies
+      - name: Debug Environment and Dependencies
         run: |
           echo "=== Dependencies ==="
           python --version
@@ -247,26 +255,24 @@ jobs:
           # 2. Extract audio with resilient multi-attempt fallback ladder
           SUCCESS=0
 
-          # Attempt 1: With sanitized cookies + PO Token Provider + Deno EJS solver
-          if [ -n "$COOKIE_ARG" ]; then
-            echo "=== Attempt 1: Downloading with sanitized cookies + PO Token Provider ==="
-            yt-dlp $COOKIE_ARG \
-              --remote-components ejs:github \
-              --js-runtimes deno \
-              --no-playlist \
-              -x --audio-format mp3 --audio-quality 128K \
-              --retries 3 --fragment-retries 3 \
-              --force-overwrites -o "extracted_audio.%(ext)s" "$CLEAN_URL" > /tmp/attempt1.log 2>&1 || true
+          # Attempt 1: With WARP consumer network + clean datacenter IP bypass (without cookies)
+          echo "=== Attempt 1: Downloading via Cloudflare WARP (no cookies, consumer IP) ==="
+          yt-dlp \
+            --remote-components ejs:github \
+            --js-runtimes deno \
+            --no-playlist \
+            -x --audio-format mp3 --audio-quality 128K \
+            --retries 3 --fragment-retries 3 \
+            --force-overwrites -o "extracted_audio.%(ext)s" "$CLEAN_URL" > /tmp/attempt1.log 2>&1 || true
 
-            cat /tmp/attempt1.log | tail -n 15
-            if [ -f "extracted_audio.mp3" ]; then
-              SUCCESS=1
-            fi
+          cat /tmp/attempt1.log | tail -n 15
+          if [ -f "extracted_audio.mp3" ]; then
+            SUCCESS=1
           fi
 
-          # Attempt 2: mweb client WITH PO Token Provider (Recommended combination for bypass)
+          # Attempt 2: mweb client WITH PO Token Provider
           if [ $SUCCESS -eq 0 ]; then
-            echo "=== Attempt 2: Downloading with mweb client + PO Token Provider (no cookies) ==="
+            echo "=== Attempt 2: Downloading with mweb client + PO Token Provider ==="
             yt-dlp \
               --remote-components ejs:github \
               --js-runtimes deno \
@@ -282,13 +288,12 @@ jobs:
             fi
           fi
 
-          # Attempt 3: iOS client WITHOUT cookies
-          if [ $SUCCESS -eq 0 ]; then
-            echo "=== Attempt 3: Downloading with iOS client (no cookies) ==="
-            yt-dlp \
+          # Attempt 3: With sanitized cookies + PO Token Provider (if cookies configured)
+          if [ $SUCCESS -eq 0 ] && [ -n "$COOKIE_ARG" ]; then
+            echo "=== Attempt 3: Downloading with sanitized cookies + PO Token Provider ==="
+            yt-dlp $COOKIE_ARG \
               --remote-components ejs:github \
               --js-runtimes deno \
-              --extractor-args "youtube:player-client=ios" \
               --no-playlist \
               -x --audio-format mp3 --audio-quality 128K \
               --retries 3 --fragment-retries 3 \
@@ -300,13 +305,13 @@ jobs:
             fi
           fi
 
-          # Attempt 4: Android client WITHOUT cookies
+          # Attempt 4: iOS client WITHOUT cookies
           if [ $SUCCESS -eq 0 ]; then
-            echo "=== Attempt 4: Downloading with Android client (no cookies) ==="
+            echo "=== Attempt 4: Downloading with iOS client ==="
             yt-dlp \
               --remote-components ejs:github \
               --js-runtimes deno \
-              --extractor-args "youtube:player-client=android" \
+              --extractor-args "youtube:player-client=ios" \
               --no-playlist \
               -x --audio-format mp3 --audio-quality 128K \
               --retries 3 --fragment-retries 3 \
@@ -318,12 +323,13 @@ jobs:
             fi
           fi
 
-          # Attempt 5: Clean datacenter IP default client WITHOUT cookies
+          # Attempt 5: Android client WITHOUT cookies
           if [ $SUCCESS -eq 0 ]; then
-            echo "=== Attempt 5: Downloading without cookies (clean datacenter IP) ==="
+            echo "=== Attempt 5: Downloading with Android client ==="
             yt-dlp \
               --remote-components ejs:github \
               --js-runtimes deno \
+              --extractor-args "youtube:player-client=android" \
               --no-playlist \
               -x --audio-format mp3 --audio-quality 128K \
               --retries 3 --fragment-retries 3 \
