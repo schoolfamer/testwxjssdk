@@ -24,7 +24,17 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - name: Set up Python
+      - name: Set up Deno (Recommended JS Engine for YouTube challenges)
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Set up Node.js 22 (Fallback JS Engine)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -34,9 +44,9 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y ffmpeg curl jq
 
-      - name: Install yt-dlp
+      - name: Install yt-dlp and EJS Challenge Solver
         run: |
-          python -m pip install --upgrade pip yt-dlp
+          python -m pip install --upgrade pip "yt-dlp[default]" yt-dlp-ejs
 
       - name: Prepare YouTube Cookies (if configured)
         env:
@@ -46,8 +56,9 @@ jobs:
             python3 - << 'EOF'
           import os, time
           raw = os.environ.get("YT_COOKIES", "").strip()
-          if raw.lstrip().startswith("#") or "\t" in raw:
-              out = raw + "\n"
+          if raw.lstrip().startswith("#") or "	" in raw:
+              out = raw + "
+"
           else:
               lines = ["# Netscape HTTP Cookie File", "# Auto-converted from Cookie header"]
               exp = str(int(time.time()) + 180 * 86400)
@@ -58,8 +69,10 @@ jobs:
                       k, v = k.strip(), v.strip()
                       if k:
                           sec = "TRUE" if k.startswith("__Secure-") else "FALSE"
-                          lines.append(f".youtube.com\tTRUE\t/\t{sec}\t{exp}\t{k}\t{v}")
-              out = "\n".join(lines) + "\n"
+                          lines.append(f".youtube.com	TRUE	/	{sec}	{exp}	{k}	{v}")
+              out = "
+".join(lines) + "
+"
           with open("/tmp/yt_cookies.txt", "w", encoding="utf-8") as f:
               f.write(out)
           print("YouTube Cookies prepared in Netscape format.")
@@ -81,7 +94,7 @@ jobs:
           fi
 
           echo "Polling YouTube Feed: $FEED_ID ($TARGET_URL)"
-          yt-dlp $COOKIE_ARG --flat-playlist --playlist-end 15 --dump-single-json --no-warnings "$TARGET_URL" > /tmp/feed.json || true
+          yt-dlp $COOKIE_ARG             --remote-components ejs:github             --js-runtimes deno,node             --flat-playlist --playlist-end 15 --dump-single-json --no-warnings "$TARGET_URL" > /tmp/feed.json || true
 
           python3 - << 'EOF' > /tmp/payload.json
           import json, os
@@ -127,12 +140,28 @@ jobs:
             CALLBACK_URL="https://transcript.unithought.com/api/internal/youtube_callback"
           fi
 
+          # Clean URL parameters (strip &t=, &pp=, etc., keep clean watch?v= or youtu.be/)
+          CLEAN_URL=$(python3 -c "
+          import sys, re
+          raw = sys.argv[1].strip()
+          m = re.search(r'[?&]v=([a-zA-Z0-9_-]{11})', raw) or re.search(r'youtu\.be/([a-zA-Z0-9_-]{11})', raw)
+          print(f'https://www.youtube.com/watch?v={m.group(1)}' if m else raw)
+          " "$VIDEO_URL")
+          echo "Target clean URL: $CLEAN_URL"
+
           COOKIE_ARG=""
           if [ -f /tmp/yt_cookies.txt ]; then
             COOKIE_ARG="--cookies /tmp/yt_cookies.txt"
           fi
 
-          METADATA_JSON=$(yt-dlp $COOKIE_ARG --js-runtimes node --extractor-args "youtube:player-client=web,ios" --no-playlist --dump-json --no-warnings "$VIDEO_URL" 2>/dev/null || true)
+          # 1. Fetch metadata with multi-tier fallback
+          echo "Fetching metadata..."
+          METADATA_JSON=$(yt-dlp $COOKIE_ARG             --remote-components ejs:github             --js-runtimes deno,node             --no-playlist --dump-json --no-warnings "$CLEAN_URL" 2>/dev/null || true)
+
+          if [ -z "$METADATA_JSON" ] && [ -n "$COOKIE_ARG" ]; then
+            echo "Metadata fetch with cookies failed, retrying without cookies..."
+            METADATA_JSON=$(yt-dlp               --remote-components ejs:github               --js-runtimes deno,node               --no-playlist --dump-json --no-warnings "$CLEAN_URL" 2>/dev/null || true)
+          fi
 
           if [ -n "$METADATA_JSON" ]; then
             TITLE=$(echo "$METADATA_JSON" | jq -r '.title // "YouTube Video"')
@@ -143,16 +172,75 @@ jobs:
             AUTHOR="YouTube"
             DURATION="0"
           fi
+          echo "Title: $TITLE | Author: $AUTHOR | Duration: $DURATION"
 
-          yt-dlp $COOKIE_ARG --js-runtimes node --extractor-args "youtube:player-client=web,ios" --no-playlist -x --audio-format mp3 --audio-quality 128K --force-overwrites -o "extracted_audio.%(ext)s" "$VIDEO_URL" || true
+          # 2. Extract audio with resilient multi-attempt fallback ladder
+          SUCCESS=0
 
+          # Attempt 1: With cookies (if provided) + Deno/Node EJS solver
+          if [ -n "$COOKIE_ARG" ]; then
+            echo "=== Attempt 1: Downloading audio with cookies and EJS solver ==="
+            yt-dlp $COOKIE_ARG               --remote-components ejs:github               --js-runtimes deno,node               --no-playlist               -x --audio-format mp3 --audio-quality 128K               --retries 3 --fragment-retries 3               --force-overwrites -o "extracted_audio.%(ext)s" "$CLEAN_URL" 2> /tmp/ytdlp_err.log || true
+
+            if [ -f "extracted_audio.mp3" ]; then
+              SUCCESS=1
+            fi
+          fi
+
+          # Attempt 2: Without cookies (if attempt 1 failed or no cookies)
+          if [ $SUCCESS -eq 0 ]; then
+            echo "=== Attempt 2: Downloading audio without cookies (clean datacenter IP) ==="
+            yt-dlp               --remote-components ejs:github               --js-runtimes deno,node               --no-playlist               -x --audio-format mp3 --audio-quality 128K               --retries 3 --fragment-retries 3               --force-overwrites -o "extracted_audio.%(ext)s" "$CLEAN_URL" 2> /tmp/ytdlp_err.log || true
+
+            if [ -f "extracted_audio.mp3" ]; then
+              SUCCESS=1
+            fi
+          fi
+
+          # Attempt 3: Fallback with mobile/android player clients
+          if [ $SUCCESS -eq 0 ]; then
+            echo "=== Attempt 3: Downloading audio with android,mweb client fallback ==="
+            yt-dlp               --remote-components ejs:github               --js-runtimes deno,node               --extractor-args "youtube:player-client=android,mweb"               --no-playlist               -x --audio-format mp3 --audio-quality 128K               --retries 3 --fragment-retries 3               --force-overwrites -o "extracted_audio.%(ext)s" "$CLEAN_URL" 2> /tmp/ytdlp_err.log || true
+
+            if [ -f "extracted_audio.mp3" ]; then
+              SUCCESS=1
+            fi
+          fi
+
+          # Attempt 4: Fallback with web_creator,mweb
+          if [ $SUCCESS -eq 0 ]; then
+            echo "=== Attempt 4: Downloading audio with web_creator,mweb fallback ==="
+            yt-dlp               --remote-components ejs:github               --js-runtimes deno,node               --extractor-args "youtube:player-client=web_creator,mweb"               --no-playlist               -x --audio-format mp3 --audio-quality 128K               --retries 3 --fragment-retries 3               --force-overwrites -o "extracted_audio.%(ext)s" "$CLEAN_URL" 2> /tmp/ytdlp_err.log || true
+
+            if [ -f "extracted_audio.mp3" ]; then
+              SUCCESS=1
+            fi
+          fi
+
+          # 3. Handle failure if still not found
           if [ ! -f "extracted_audio.mp3" ]; then
-            curl -s -X POST "$CALLBACK_URL/fail"               -H "Authorization: Bearer $AUTH_TOKEN"               -F "task_id=$TASK_ID"               -F "error=GitHub Actions overseas runner failed to download audio stream (bot check or unavailable)" || true
+            ERR_MSG="GitHub Actions overseas runner failed to download audio stream"
+            if [ -f /tmp/ytdlp_err.log ]; then
+              TAIL_ERR=$(tail -n 5 /tmp/ytdlp_err.log | tr '
+' ' ' | sed 's/"//g')
+              if [ -n "$TAIL_ERR" ]; then
+                ERR_MSG="$ERR_MSG: $TAIL_ERR"
+              fi
+            fi
+            echo "ERROR: Audio extraction failed: $ERR_MSG"
+            curl -s -X POST "$CALLBACK_URL/fail"               -H "Authorization: Bearer $AUTH_TOKEN"               -F "task_id=$TASK_ID"               -F "error=$ERR_MSG" || true
             exit 1
           fi
 
+          echo "Audio extraction successful! File size: $(stat -c%s extracted_audio.mp3 2>/dev/null || stat -f%z extracted_audio.mp3) bytes"
+
+          # 4. Upload to callback
           HTTP_STATUS=$(curl -s -o /tmp/resp.txt -w "%{http_code}" -X POST "$CALLBACK_URL"             -H "Authorization: Bearer $AUTH_TOKEN"             -F "task_id=$TASK_ID"             -F "file=@extracted_audio.mp3;type=audio/mpeg"             -F "title=$TITLE"             -F "author=$AUTHOR"             -F "duration=$DURATION")
 
+          echo "Callback HTTP status: $HTTP_STATUS"
+          cat /tmp/resp.txt || true
+
           if [ "$HTTP_STATUS" != "200" ] && [ "$HTTP_STATUS" != "201" ]; then
+            echo "Callback returned error status: $HTTP_STATUS"
             exit 1
           fi
