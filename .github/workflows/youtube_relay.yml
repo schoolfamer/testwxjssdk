@@ -39,14 +39,20 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Start bgutil PO Token Provider (BotGuard Attestation Backend)
+        run: |
+          docker run --name bgutil-provider -d --init -p 127.0.0.1:4416:4416 brainicism/bgutil-ytdlp-pot-provider
+          sleep 3
+          curl -s http://127.0.0.1:4416/ping || curl -s http://127.0.0.1:4416/ || echo "bgutil provider started"
+
       - name: Install System Dependencies (ffmpeg, curl, jq)
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y ffmpeg curl jq
 
-      - name: Install yt-dlp and EJS Challenge Solver
+      - name: Install yt-dlp, EJS Solver and PO Token Provider Plugin
         run: |
-          python -m pip install --upgrade pip "yt-dlp[default]" yt-dlp-ejs
+          python -m pip install --upgrade pip "yt-dlp[default]" yt-dlp-ejs bgutil-ytdlp-pot-provider
 
       - name: Prepare YouTube Cookies (if configured)
         env:
@@ -56,23 +62,45 @@ jobs:
             python3 -c '
           import os, time
           raw = os.environ.get("YT_COOKIES", "").strip()
+          exp = str(int(time.time()) + 180 * 86400)
+          lines = ["# Netscape HTTP Cookie File", "# Sanitized for YouTube and Google"]
+
           if raw.lstrip().startswith("#") or "\t" in raw:
-              out = raw + "\n"
+              for line in raw.splitlines():
+                  line = line.strip()
+                  if not line:
+                      continue
+                  if line.startswith("#"):
+                      lines.append(line)
+                      continue
+                  parts = line.split("\t")
+                  if len(parts) >= 7:
+                      name = parts[5].strip()
+                      # Filter out rolling timestamp tokens that invalidate static cookies
+                      if name in ("__Secure-1PSIDTS", "__Secure-3PSIDTS"):
+                          continue
+                      lines.append(line)
+                      if ".youtube.com" in parts[0]:
+                          google_part = parts.copy()
+                          google_part[0] = ".google.com"
+                          lines.append("\t".join(google_part))
           else:
-              lines = ["# Netscape HTTP Cookie File", "# Auto-converted from Cookie header"]
-              exp = str(int(time.time()) + 180 * 86400)
               for part in raw.split(";"):
                   part = part.strip()
                   if "=" in part:
                       k, v = part.split("=", 1)
                       k, v = k.strip(), v.strip()
+                      if k in ("__Secure-1PSIDTS", "__Secure-3PSIDTS"):
+                          continue
                       if k:
                           sec = "TRUE" if k.startswith("__Secure-") else "FALSE"
                           lines.append(f".youtube.com\tTRUE\t/\t{sec}\t{exp}\t{k}\t{v}")
-              out = "\n".join(lines) + "\n"
+                          lines.append(f".google.com\tTRUE\t/\t{sec}\t{exp}\t{k}\t{v}")
+
+          out = "\n".join(lines) + "\n"
           with open("/tmp/yt_cookies.txt", "w", encoding="utf-8") as f:
               f.write(out)
-          print("YouTube Cookies prepared in Netscape format.")
+          print("YouTube Cookies prepared with rolling tokens stripped and google.com paired.")
           '
           fi
 
@@ -197,11 +225,11 @@ jobs:
           fi
 
           if [ -z "$METADATA_JSON" ]; then
-            echo "Retrying metadata with iOS client..."
+            echo "Retrying metadata with mweb client..."
             METADATA_JSON=$(yt-dlp \
               --remote-components ejs:github \
               --js-runtimes deno \
-              --extractor-args "youtube:player-client=ios" \
+              --extractor-args "youtube:player-client=mweb" \
               --no-playlist --dump-json --no-warnings "$CLEAN_URL" 2>/dev/null || true)
           fi
 
@@ -219,9 +247,9 @@ jobs:
           # 2. Extract audio with resilient multi-attempt fallback ladder
           SUCCESS=0
 
-          # Attempt 1: With cookies (if provided) + Deno EJS solver
+          # Attempt 1: With sanitized cookies + PO Token Provider + Deno EJS solver
           if [ -n "$COOKIE_ARG" ]; then
-            echo "=== Attempt 1: Downloading with cookies + Deno EJS solver ==="
+            echo "=== Attempt 1: Downloading with sanitized cookies + PO Token Provider ==="
             yt-dlp $COOKIE_ARG \
               --remote-components ejs:github \
               --js-runtimes deno \
@@ -236,13 +264,13 @@ jobs:
             fi
           fi
 
-          # Attempt 2: iOS client WITHOUT cookies (Datacenter bot-guard bypass)
+          # Attempt 2: mweb client WITH PO Token Provider (Recommended combination for bypass)
           if [ $SUCCESS -eq 0 ]; then
-            echo "=== Attempt 2: Downloading with iOS client (no cookies, bot-guard bypass) ==="
+            echo "=== Attempt 2: Downloading with mweb client + PO Token Provider (no cookies) ==="
             yt-dlp \
               --remote-components ejs:github \
               --js-runtimes deno \
-              --extractor-args "youtube:player-client=ios" \
+              --extractor-args "youtube:player-client=mweb" \
               --no-playlist \
               -x --audio-format mp3 --audio-quality 128K \
               --retries 3 --fragment-retries 3 \
@@ -254,13 +282,13 @@ jobs:
             fi
           fi
 
-          # Attempt 3: Android client WITHOUT cookies
+          # Attempt 3: iOS client WITHOUT cookies
           if [ $SUCCESS -eq 0 ]; then
-            echo "=== Attempt 3: Downloading with Android client (no cookies) ==="
+            echo "=== Attempt 3: Downloading with iOS client (no cookies) ==="
             yt-dlp \
               --remote-components ejs:github \
               --js-runtimes deno \
-              --extractor-args "youtube:player-client=android" \
+              --extractor-args "youtube:player-client=ios" \
               --no-playlist \
               -x --audio-format mp3 --audio-quality 128K \
               --retries 3 --fragment-retries 3 \
@@ -272,12 +300,13 @@ jobs:
             fi
           fi
 
-          # Attempt 4: Clean datacenter IP default client WITHOUT cookies
+          # Attempt 4: Android client WITHOUT cookies
           if [ $SUCCESS -eq 0 ]; then
-            echo "=== Attempt 4: Downloading without cookies (clean datacenter IP) ==="
+            echo "=== Attempt 4: Downloading with Android client (no cookies) ==="
             yt-dlp \
               --remote-components ejs:github \
               --js-runtimes deno \
+              --extractor-args "youtube:player-client=android" \
               --no-playlist \
               -x --audio-format mp3 --audio-quality 128K \
               --retries 3 --fragment-retries 3 \
@@ -289,13 +318,12 @@ jobs:
             fi
           fi
 
-          # Attempt 5: TV client fallback
+          # Attempt 5: Clean datacenter IP default client WITHOUT cookies
           if [ $SUCCESS -eq 0 ]; then
-            echo "=== Attempt 5: Downloading with TV client fallback ==="
+            echo "=== Attempt 5: Downloading without cookies (clean datacenter IP) ==="
             yt-dlp \
               --remote-components ejs:github \
               --js-runtimes deno \
-              --extractor-args "youtube:player-client=tv" \
               --no-playlist \
               -x --audio-format mp3 --audio-quality 128K \
               --retries 3 --fragment-retries 3 \
