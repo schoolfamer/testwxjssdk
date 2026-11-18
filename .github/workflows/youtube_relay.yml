@@ -76,6 +76,30 @@ jobs:
           '
           fi
 
+      - name: Debug Environment and Cookies
+        run: |
+          echo "=== Dependencies ==="
+          python --version
+          node --version
+          deno --version
+          yt-dlp --version
+          if [ -f /tmp/yt_cookies.txt ]; then
+            python3 -c '
+          with open("/tmp/yt_cookies.txt") as f:
+              lines = [l.strip() for l in f if l.strip()]
+          print(f"Total cookie lines: {len(lines)}")
+          for l in lines:
+              if not l.startswith("#"):
+                  parts = l.split("\t")
+                  if len(parts) >= 7:
+                      print(f"  Domain: {parts[0]} | Secure: {parts[3]} | Name: {parts[5]} | ValLen: {len(parts[6])}")
+                  else:
+                      print(f"  Raw: {l[:40]}...")
+          '
+          else
+            echo "No cookies configured."
+          fi
+
       - name: Poll YouTube Channel / Playlist Feed
         if: github.event.action == 'youtube_feed_poll'
         env:
@@ -93,7 +117,7 @@ jobs:
           echo "Polling YouTube Feed: $FEED_ID ($TARGET_URL)"
           yt-dlp $COOKIE_ARG \
             --remote-components ejs:github \
-            --js-runtimes deno,node \
+            --js-runtimes deno \
             --flat-playlist --playlist-end 15 --dump-single-json --no-warnings "$TARGET_URL" > /tmp/feed.json || true
 
           python3 -c '
@@ -157,18 +181,27 @@ jobs:
             COOKIE_ARG="--cookies /tmp/yt_cookies.txt"
           fi
 
-          # 1. Fetch metadata with multi-tier fallback
+          # 1. Fetch metadata
           echo "Fetching metadata..."
           METADATA_JSON=$(yt-dlp $COOKIE_ARG \
             --remote-components ejs:github \
-            --js-runtimes deno,node \
+            --js-runtimes deno \
             --no-playlist --dump-json --no-warnings "$CLEAN_URL" 2>/dev/null || true)
 
           if [ -z "$METADATA_JSON" ] && [ -n "$COOKIE_ARG" ]; then
             echo "Metadata fetch with cookies failed, retrying without cookies..."
             METADATA_JSON=$(yt-dlp \
               --remote-components ejs:github \
-              --js-runtimes deno,node \
+              --js-runtimes deno \
+              --no-playlist --dump-json --no-warnings "$CLEAN_URL" 2>/dev/null || true)
+          fi
+
+          if [ -z "$METADATA_JSON" ]; then
+            echo "Retrying metadata with iOS client..."
+            METADATA_JSON=$(yt-dlp \
+              --remote-components ejs:github \
+              --js-runtimes deno \
+              --extractor-args "youtube:player-client=ios" \
               --no-playlist --dump-json --no-warnings "$CLEAN_URL" 2>/dev/null || true)
           fi
 
@@ -186,67 +219,107 @@ jobs:
           # 2. Extract audio with resilient multi-attempt fallback ladder
           SUCCESS=0
 
-          # Attempt 1: With cookies (if provided) + Deno/Node EJS solver
+          # Attempt 1: With cookies (if provided) + Deno EJS solver
           if [ -n "$COOKIE_ARG" ]; then
-            echo "=== Attempt 1: Downloading audio with cookies and EJS solver ==="
+            echo "=== Attempt 1: Downloading with cookies + Deno EJS solver ==="
             yt-dlp $COOKIE_ARG \
               --remote-components ejs:github \
-              --js-runtimes deno,node \
+              --js-runtimes deno \
               --no-playlist \
               -x --audio-format mp3 --audio-quality 128K \
               --retries 3 --fragment-retries 3 \
-              --force-overwrites -o "extracted_audio.%(ext)s" "$CLEAN_URL" 2> /tmp/ytdlp_err.log || true
+              --force-overwrites -o "extracted_audio.%(ext)s" "$CLEAN_URL" > /tmp/attempt1.log 2>&1 || true
 
+            cat /tmp/attempt1.log | tail -n 15
             if [ -f "extracted_audio.mp3" ]; then
               SUCCESS=1
             fi
           fi
 
-          # Attempt 2: Without cookies (if attempt 1 failed or no cookies)
+          # Attempt 2: iOS client WITHOUT cookies (Datacenter bot-guard bypass)
           if [ $SUCCESS -eq 0 ]; then
-            echo "=== Attempt 2: Downloading audio without cookies (clean datacenter IP) ==="
+            echo "=== Attempt 2: Downloading with iOS client (no cookies, bot-guard bypass) ==="
             yt-dlp \
               --remote-components ejs:github \
-              --js-runtimes deno,node \
+              --js-runtimes deno \
+              --extractor-args "youtube:player-client=ios" \
               --no-playlist \
               -x --audio-format mp3 --audio-quality 128K \
               --retries 3 --fragment-retries 3 \
-              --force-overwrites -o "extracted_audio.%(ext)s" "$CLEAN_URL" 2> /tmp/ytdlp_err.log || true
+              --force-overwrites -o "extracted_audio.%(ext)s" "$CLEAN_URL" > /tmp/attempt2.log 2>&1 || true
 
+            cat /tmp/attempt2.log | tail -n 15
             if [ -f "extracted_audio.mp3" ]; then
               SUCCESS=1
             fi
           fi
 
-          # Attempt 3: Fallback with mobile/android player clients
+          # Attempt 3: Android client WITHOUT cookies
           if [ $SUCCESS -eq 0 ]; then
-            echo "=== Attempt 3: Downloading audio with android,mweb client fallback ==="
+            echo "=== Attempt 3: Downloading with Android client (no cookies) ==="
             yt-dlp \
               --remote-components ejs:github \
-              --js-runtimes deno,node \
-              --extractor-args "youtube:player-client=android,mweb" \
+              --js-runtimes deno \
+              --extractor-args "youtube:player-client=android" \
               --no-playlist \
               -x --audio-format mp3 --audio-quality 128K \
               --retries 3 --fragment-retries 3 \
-              --force-overwrites -o "extracted_audio.%(ext)s" "$CLEAN_URL" 2> /tmp/ytdlp_err.log || true
+              --force-overwrites -o "extracted_audio.%(ext)s" "$CLEAN_URL" > /tmp/attempt3.log 2>&1 || true
 
+            cat /tmp/attempt3.log | tail -n 15
             if [ -f "extracted_audio.mp3" ]; then
               SUCCESS=1
             fi
           fi
 
-          # Attempt 4: Fallback with web_creator,mweb
+          # Attempt 4: Clean datacenter IP default client WITHOUT cookies
           if [ $SUCCESS -eq 0 ]; then
-            echo "=== Attempt 4: Downloading audio with web_creator,mweb fallback ==="
+            echo "=== Attempt 4: Downloading without cookies (clean datacenter IP) ==="
             yt-dlp \
               --remote-components ejs:github \
-              --js-runtimes deno,node \
+              --js-runtimes deno \
+              --no-playlist \
+              -x --audio-format mp3 --audio-quality 128K \
+              --retries 3 --fragment-retries 3 \
+              --force-overwrites -o "extracted_audio.%(ext)s" "$CLEAN_URL" > /tmp/attempt4.log 2>&1 || true
+
+            cat /tmp/attempt4.log | tail -n 15
+            if [ -f "extracted_audio.mp3" ]; then
+              SUCCESS=1
+            fi
+          fi
+
+          # Attempt 5: TV client fallback
+          if [ $SUCCESS -eq 0 ]; then
+            echo "=== Attempt 5: Downloading with TV client fallback ==="
+            yt-dlp \
+              --remote-components ejs:github \
+              --js-runtimes deno \
+              --extractor-args "youtube:player-client=tv" \
+              --no-playlist \
+              -x --audio-format mp3 --audio-quality 128K \
+              --retries 3 --fragment-retries 3 \
+              --force-overwrites -o "extracted_audio.%(ext)s" "$CLEAN_URL" > /tmp/attempt5.log 2>&1 || true
+
+            cat /tmp/attempt5.log | tail -n 15
+            if [ -f "extracted_audio.mp3" ]; then
+              SUCCESS=1
+            fi
+          fi
+
+          # Attempt 6: Web Creator + MWeb fallback
+          if [ $SUCCESS -eq 0 ]; then
+            echo "=== Attempt 6: Downloading with web_creator,mweb fallback ==="
+            yt-dlp \
+              --remote-components ejs:github \
+              --js-runtimes deno \
               --extractor-args "youtube:player-client=web_creator,mweb" \
               --no-playlist \
               -x --audio-format mp3 --audio-quality 128K \
               --retries 3 --fragment-retries 3 \
-              --force-overwrites -o "extracted_audio.%(ext)s" "$CLEAN_URL" 2> /tmp/ytdlp_err.log || true
+              --force-overwrites -o "extracted_audio.%(ext)s" "$CLEAN_URL" > /tmp/attempt6.log 2>&1 || true
 
+            cat /tmp/attempt6.log | tail -n 15
             if [ -f "extracted_audio.mp3" ]; then
               SUCCESS=1
             fi
@@ -254,13 +327,7 @@ jobs:
 
           # 3. Handle failure if still not found
           if [ ! -f "extracted_audio.mp3" ]; then
-            ERR_MSG="GitHub Actions overseas runner failed to download audio stream"
-            if [ -f /tmp/ytdlp_err.log ]; then
-              TAIL_ERR=$(tail -n 5 /tmp/ytdlp_err.log | tr '\n' ' ' | sed 's/"//g')
-              if [ -n "$TAIL_ERR" ]; then
-                ERR_MSG="$ERR_MSG: $TAIL_ERR"
-              fi
-            fi
+            ERR_MSG="GitHub Actions overseas runner failed to download audio stream across all fallback clients"
             echo "ERROR: Audio extraction failed: $ERR_MSG"
             curl -s -X POST "$CALLBACK_URL/fail" \
               -H "Authorization: Bearer $AUTH_TOKEN" \
